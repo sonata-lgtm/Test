@@ -7,6 +7,7 @@ Outlook: via Desktop COM (no password/IMAP required)
 
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import HTMLResponse
+from fastapi.concurrency import run_in_threadpool
 import uvicorn
 import sqlite3
 import json, os, re, hashlib, threading
@@ -28,21 +29,22 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    # Settings table
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY, value TEXT)''')
-    # Rules table
     c.execute('''CREATE TABLE IF NOT EXISTS rules (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     folder_path TEXT NOT NULL,
                     entry_id TEXT NOT NULL,
+                    sender_email TEXT DEFAULT '',
                     subject_keywords TEXT DEFAULT '',
                     match_mode TEXT DEFAULT 'any',
+                    attachment_types TEXT DEFAULT '',
+                    use_prefix INTEGER DEFAULT 1,
+                    received_after TEXT DEFAULT '',
                     destination TEXT NOT NULL,
                     enabled INTEGER DEFAULT 1,
                     last_check TEXT)''')
-    # Tracking table (prevents re-downloads)
     c.execute('''CREATE TABLE IF NOT EXISTS tracking (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     rule_id TEXT NOT NULL,
@@ -51,16 +53,26 @@ def init_db():
                     filename TEXT,
                     downloaded_at TEXT,
                     UNIQUE(rule_id, mail_entry_id, file_hash))''')
-    # Logs table
     c.execute('''CREATE TABLE IF NOT EXISTS logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     rule_id TEXT,
                     level TEXT DEFAULT 'info',
                     message TEXT,
                     timestamp TEXT DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # Add index for fast tracking lookups
     c.execute('CREATE INDEX IF NOT EXISTS idx_tracking_rule ON tracking(rule_id, mail_entry_id)')
+    
+    # Migrate: add new columns if missing (safe for existing DBs)
+    new_cols = {
+        'sender_email': 'TEXT DEFAULT \'\'',
+        'attachment_types': 'TEXT DEFAULT \'\'',
+        'use_prefix': 'INTEGER DEFAULT 1',
+        'received_after': 'TEXT DEFAULT \'\''
+    }
+    existing = [col[1] for col in c.execute("PRAGMA table_info(rules)").fetchall()]
+    for col, typedef in new_cols.items():
+        if col not in existing:
+            c.execute(f"ALTER TABLE rules ADD COLUMN {col} {typedef}")
+    
     conn.commit()
     conn.close()
 
@@ -71,14 +83,13 @@ init_db()
 # ═══════════════════════════════════════════════════════════
 api = FastAPI()
 
-# Global state for progress tracking
 progress_state = {"running": False, "items": []}
 progress_lock = threading.Lock()
 stop_event = threading.Event()
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ═══════════════════════════════════════════════════════════
-# COM Helpers
+# COM Helpers (all called via run_in_threadpool)
 # ═══════════════════════════════════════════════════════════
 def walk_folders(folder, depth=0):
     result = []
@@ -88,14 +99,16 @@ def walk_folders(folder, depth=0):
             'path': folder.FolderPath, 'depth': depth,
             'has_children': folder.Folders.Count > 0
         })
-    except Exception: return result
+    except Exception:
+        return result
     try:
         for i in range(1, folder.Folders.Count + 1):
             result.extend(walk_folders(folder.Folders.Item(i), depth + 1))
-    except Exception: pass
+    except Exception:
+        pass
     return result
 
-def list_all_folders():
+def _com_list_folders():
     pythoncom.CoInitialize()
     try:
         ol = win32com.client.Dispatch("Outlook.Application")
@@ -110,38 +123,93 @@ def list_all_folders():
     finally:
         pythoncom.CoUninitialize()
 
-def check_outlook():
+def _com_check_outlook():
     pythoncom.CoInitialize()
     try:
         ol = win32com.client.Dispatch("Outlook.Application")
         ns = ol.GetNamespace("MAPI")
         n = ns.Stores.Count
-        names = [ns.Stores.Item(i).DisplayName for i in range(1, n + 1) if _safe_get_store_name(ns, i)]
+        names = []
+        for i in range(1, n + 1):
+            try:
+                names.append(ns.Stores.Item(i).DisplayName)
+            except Exception:
+                names.append('?')
         return {'ok': True, 'msg': f'{n} account(s): {", ".join(names)}'}
     except Exception as e:
         return {'ok': False, 'msg': str(e)}
     finally:
         pythoncom.CoUninitialize()
 
-def _safe_get_store_name(ns, i):
-    try: return ns.Stores.Item(i).DisplayName
-    except: return '?'
-
-def build_dasl(keywords, mode):
-    prop = "urn:schemas:httpmail:subject"
-    esc = [k.replace("'", "''") for k in keywords]
-    parts = [f'"{prop}" LIKE \'%{k}%\'' for k in esc]
-    return (' AND ' if mode == 'all' else ' OR ').join(parts)
+def build_dasl(rule):
+    """Build combined DASL filter for subject, sender, and date."""
+    clauses = []
+    
+    # Subject keywords
+    kws = [k.strip() for k in (rule['subject_keywords'] or '').split(',') if k.strip()]
+    if kws:
+        esc = [k.replace("'", "''") for k in kws]
+        mode = rule['match_mode'] or 'any'
+        joiner = ' AND ' if mode == 'all' else ' OR '
+        subj_clauses = [f'"urn:schemas:httpmail:subject" LIKE \'%{k}%\'' for k in esc]
+        clauses.append('(' + joiner.join(subj_clauses) + ')')
+    
+    # Sender email
+    sender = (rule['sender_email'] or '').strip()
+    if sender:
+        esc_s = sender.replace("'", "''")
+        clauses.append(f'"urn:schemas:httpmail:fromemail" LIKE \'%{esc_s}%\'')
+    
+    # Received after date
+    after = (rule['received_after'] or '').strip()
+    if after:
+        try:
+            dt = datetime.strptime(after, '%Y-%m-%d')
+            clauses.append(f'"[ReceivedTime]" >= \'{dt.strftime("%Y-%m-%d %H:%M:%S")}\'')
+        except ValueError:
+            pass
+    
+    return ' AND '.join(clauses) if clauses else ''
 
 def safe_fn(name):
-    if not name: return 'unnamed'
+    if not name:
+        return 'unnamed'
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip('. ')
 
 def com2dt(cd):
     try:
-        if hasattr(cd, 'year'): return datetime(cd.year, cd.month, cd.day, cd.hour, cd.minute, cd.second)
+        if hasattr(cd, 'year'):
+            return datetime(cd.year, cd.month, cd.day, cd.hour, cd.minute, cd.second)
         return datetime.fromtimestamp(int(cd))
-    except: return None
+    except Exception:
+        return None
+
+def is_valid_attachment(att, allowed_types):
+    """Check if attachment is a real file (not inline/hidden) and matches type filter."""
+    # Skip non-file attachments: linked (6), embedded (4), OLE (5)
+    if att.Type != 1:  # Only olByValue (1) = real file attachment
+        return False
+    # Skip inline images referenced by Content-ID in HTML body
+    try:
+        cid = str(att.ContentId or '').strip()
+        if cid:
+            return False
+    except Exception:
+        pass
+    # Skip if no filename
+    fn = ''
+    try:
+        fn = str(att.FileName or '').strip()
+    except Exception:
+        pass
+    if not fn:
+        return False
+    # Check extension filter
+    if allowed_types:
+        ext = fn.rsplit('.', 1)[-1].lower()
+        if ext not in allowed_types:
+            return False
+    return True
 
 # ═══════════════════════════════════════════════════════════
 # Background Download Logic
@@ -149,7 +217,7 @@ def com2dt(cd):
 def add_log(rule_id, level, message):
     try:
         conn = get_db()
-        conn.execute("INSERT INTO logs (rule_id, level, message) VALUES (?, ?, ?)", 
+        conn.execute("INSERT INTO logs (rule_id, level, message) VALUES (?, ?, ?)",
                      (rule_id, level, message))
         conn.commit()
         conn.close()
@@ -159,14 +227,13 @@ def add_log(rule_id, level, message):
 def is_downloaded(rule_id, mail_eid, file_hash):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM tracking WHERE rule_id=? AND mail_entry_id=? AND file_hash=?", 
+    cur.execute("SELECT 1 FROM tracking WHERE rule_id=? AND mail_entry_id=? AND file_hash=?",
                 (rule_id, mail_eid, file_hash))
     exists = cur.fetchone() is not None
     conn.close()
     return exists
 
 def mark_mail_checked(rule_id, mail_eid):
-    # Mark an email as processed even if it had no attachments
     if not is_downloaded(rule_id, mail_eid, '_checked'):
         conn = get_db()
         conn.execute("INSERT OR IGNORE INTO tracking (rule_id, mail_entry_id, file_hash, filename, downloaded_at) VALUES (?, ?, ?, NULL, ?)",
@@ -198,6 +265,8 @@ def process_rule(rule_id):
             progress_state['items'] = [p for p in progress_state['items'] if p['rule_id'] != rule_id]
         return
 
+    rule = dict(rule)
+
     def upd(**kw):
         with progress_lock:
             for p in progress_state['items']:
@@ -219,10 +288,10 @@ def process_rule(rule_id):
         folder = ns.GetFolderFromID(rule['entry_id'])
         items = folder.Items
 
-        # Subject filter via DASL (fast, server-side)
-        kws = [k.strip() for k in (rule['subject_keywords'] or '').split(',') if k.strip()]
-        if kws:
-            items = items.Restrict(build_dasl(kws, rule['match_mode']))
+        # Build and apply DASL filter (subject + sender + date)
+        dasl = build_dasl(rule)
+        if dasl:
+            items = items.Restrict(dasl)
 
         total = items.Count
         if total == 0:
@@ -230,18 +299,28 @@ def process_rule(rule_id):
             update_last_check(rule_id)
             return
 
-        # Sort newest first for fast early-exit
-        try: items.Sort("[ReceivedTime]", True)
-        except: pass
+        # Sort newest first
+        try:
+            items.Sort("[ReceivedTime]", True)
+        except Exception:
+            pass
 
-        # Calculate date cutoff
-        last_check_str = rule['last_check']
+        # Date cutoff from last_check for fast early-exit
+        last_check_str = rule.get('last_check')
         since = None
         if last_check_str:
-            try: since = datetime.fromisoformat(last_check_str) - timedelta(hours=1)
-            except: pass
+            try:
+                since = datetime.fromisoformat(last_check_str) - timedelta(hours=1)
+            except Exception:
+                pass
 
-        upd(status='processing', msg=f'Scanning {total} emails since {since.strftime("%Y-%m-%d %H:%M") if since else "beginning"}')
+        # Parse allowed attachment types
+        types_str = (rule.get('attachment_types') or '').strip()
+        allowed_types = [t.strip().lower().lstrip('.') for t in types_str.split(',') if t.strip()] if types_str else []
+        use_prefix = bool(rule.get('use_prefix', 1))
+
+        since_label = since.strftime("%Y-%m-%d %H:%M") if since else "beginning"
+        upd(status='processing', msg=f'Scanning {total} emails since {since_label}')
 
         dest = rule['destination']
         os.makedirs(dest, exist_ok=True)
@@ -255,16 +334,17 @@ def process_rule(rule_id):
 
             try:
                 item = items.Item(i)
-                if item.Class != 43: continue # Skip non-mail
+                if item.Class != 43:
+                    continue
 
-                # FAST EXIT: Stop scanning if we hit emails older than last check
+                # FAST EXIT: stop if older than last check
                 rx = com2dt(item.ReceivedTime)
                 if since and rx and rx < since:
                     break
 
                 eid = item.EntryID
-                
-                # Skip if we already processed this email entirely
+
+                # Skip if already fully processed
                 if is_downloaded(rule_id, eid, '_checked'):
                     sk += 1
                     continue
@@ -273,9 +353,16 @@ def process_rule(rule_id):
                 try:
                     for j in range(1, item.Attachments.Count + 1):
                         if stop_event.is_set():
-                            upd(status='stopped', msg='Stopped by user'); return
-                        
+                            upd(status='stopped', msg='Stopped by user')
+                            return
+
                         att = item.Attachments.Item(j)
+
+                        # Filter: skip inline/hidden/linked, check type
+                        if not is_valid_attachment(att, allowed_types):
+                            sk += 1
+                            continue
+
                         fn = safe_fn(att.FileName)
                         fh = hashlib.md5((eid + fn).encode()).hexdigest()[:12]
 
@@ -283,18 +370,27 @@ def process_rule(rule_id):
                             sk += 1
                             continue
 
-                        pfx = rx.strftime('%Y%m%d_%H%M%S') if rx else datetime.now().strftime('%Y%m%d_%H%M%S')
-                        sp = os.path.join(dest, f'{pfx}_{fn}')
-                        c, base, ext = 1, *os.path.splitext(sp)
+                        # Build save path
+                        if use_prefix:
+                            pfx = rx.strftime('%Y%m%d_%H%M%S') if rx else datetime.now().strftime('%Y%m%d_%H%M%S')
+                            save_name = f'{pfx}_{fn}'
+                        else:
+                            save_name = fn
+
+                        sp = os.path.join(dest, save_name)
+                        c = 1
+                        base, ext = os.path.splitext(sp)
                         while os.path.exists(sp):
-                            sp = f'{base}_{c}{ext}'; c += 1
+                            sp = f'{base}_{c}{ext}'
+                            c += 1
 
                         att.SaveAsFile(sp)
-                        dl += 1; adl += 1
+                        dl += 1
+                        adl += 1
                         record_download(rule_id, eid, fh, fn)
                 except Exception as e:
                     er += 1
-                    add_log(rule_id, 'error', f"Attachment error on {eid}: {str(e)}")
+                    add_log(rule_id, 'error', f"Attachment error: {str(e)}")
 
                 if adl == 0:
                     mark_mail_checked(rule_id, eid)
@@ -322,25 +418,30 @@ def run_all_rules():
     with progress_lock:
         progress_state['running'] = True
         progress_state['items'] = []
-    
     stop_event.clear()
-    
+
     conn = get_db()
     rules = conn.execute("SELECT * FROM rules WHERE enabled=1").fetchall()
     conn.close()
 
     if not rules:
-        with progress_lock: progress_state['running'] = False
+        with progress_lock:
+            progress_state['running'] = False
         return
 
     futures = [executor.submit(process_rule, rule['id']) for rule in rules]
     for f in as_completed(futures):
-        try: f.result()
+        try:
+            f.result()
         except Exception as e:
             with progress_lock:
-                progress_state['items'].append({'rule_id':'sys','name':'System','status':'error','msg':str(e),'dl':0,'skip':0,'err':0,'pct':0,'ts':''})
-    
-    with progress_lock: progress_state['running'] = False
+                progress_state['items'].append({
+                    'rule_id': 'sys', 'name': 'System', 'status': 'error',
+                    'msg': str(e), 'dl': 0, 'skip': 0, 'err': 0, 'pct': 0, 'ts': ''
+                })
+
+    with progress_lock:
+        progress_state['running'] = False
 
 # ═══════════════════════════════════════════════════════════
 # API Endpoints
@@ -351,12 +452,12 @@ async def serve_ui():
 
 @api.get("/api/status")
 async def api_status():
-    return check_outlook()
+    return await run_in_threadpool(_com_check_outlook)
 
 @api.get("/api/folders")
 async def api_folders():
     try:
-        return {"ok": True, "folders": list_all_folders()}
+        return {"ok": True, "folders": await run_in_threadpool(_com_list_folders)}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
@@ -370,11 +471,15 @@ async def api_get_rules():
 @api.post("/api/rules")
 async def api_save_rule(rule: dict):
     conn = get_db()
-    conn.execute('''INSERT OR REPLACE INTO rules (id, name, folder_path, entry_id, subject_keywords, match_mode, destination, enabled, last_check)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                 (rule.get('id'), rule.get('name'), rule.get('folder'), rule.get('entry_id'),
-                  rule.get('subject_keywords', ''), rule.get('match_mode', 'any'),
-                  rule.get('destination'), 1 if rule.get('enabled') else 0, rule.get('last_check')))
+    conn.execute('''INSERT OR REPLACE INTO rules 
+                    (id, name, folder_path, entry_id, sender_email, subject_keywords, match_mode,
+                     attachment_types, use_prefix, received_after, destination, enabled, last_check)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (rule.get('id'), rule.get('name'), rule.get('folder_path'), rule.get('entry_id'),
+                  rule.get('sender_email', ''), rule.get('subject_keywords', ''), rule.get('match_mode', 'any'),
+                  rule.get('attachment_types', ''), 1 if rule.get('use_prefix') else 0,
+                  rule.get('received_after', ''), rule.get('destination'),
+                  1 if rule.get('enabled') else 0, rule.get('last_check')))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -399,7 +504,8 @@ async def api_delete_rule(rule_id: str):
 @api.post("/api/run")
 async def api_run(background_tasks: BackgroundTasks):
     with progress_lock:
-        if progress_state['running']: return {"ok": False, "msg": "Already running"}
+        if progress_state['running']:
+            return {"ok": False, "msg": "Already running"}
     background_tasks.add_task(run_all_rules)
     return {"ok": True}
 
@@ -449,9 +555,21 @@ HTML_CONTENT = """<!DOCTYPE html>
 <title>Outlook Attachment Downloader</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0c1017;--sf:#131a24;--cd:#19222f;--cdh:#1e2a3a;--bd:#253040;--bdh:#354560;--tx:#dce6f0;--mt:#6b7f96;--dm:#3a4d62;--ac:#00d68f;--ach:#22ffaa;--acd:rgba(0,214,143,.1);--dn:#ff5c5c;--dnd:rgba(255,92,92,.1);--wn:#f0b429;--wnD:rgba(240,180,41,.1);--in:#4da6ff;--ind:rgba(77,166,255,.1);--r:8px;--rs:5px;--f:'Segoe UI',system-ui,sans-serif;--m:'Cascadia Code',Consolas,monospace}
+:root{
+  --bg:#0c1017;--sf:#131a24;--cd:#19222f;--cdh:#1e2a3a;
+  --bd:#253040;--bdh:#354560;
+  --tx:#dce6f0;--mt:#6b7f96;--dm:#3a4d62;
+  --ac:#00d68f;--ach:#22ffaa;--acd:rgba(0,214,143,.1);
+  --dn:#ff5c5c;--dnd:rgba(255,92,92,.1);
+  --wn:#f0b429;--wnD:rgba(240,180,41,.1);
+  --in:#4da6ff;--ind:rgba(77,166,255,.1);
+  --r:8px;--rs:5px;
+  --f:'Segoe UI',system-ui,sans-serif;
+  --m:'Cascadia Code',Consolas,monospace;
+}
 html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--tx);font-family:var(--f);font-size:13px;line-height:1.5}
 #app{display:flex;flex-direction:column;height:100vh}
+
 .hdr{height:52px;min-height:52px;background:var(--sf);border-bottom:1px solid var(--bd);display:flex;align-items:center;padding:0 20px;gap:14px}
 .logo{font-size:14px;font-weight:700;color:var(--ac);letter-spacing:-.3px;white-space:nowrap}
 .logo span{color:var(--mt);font-weight:400;font-size:12px}
@@ -461,64 +579,98 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--tx);font-
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block}
 .dot.on{background:var(--ac);box-shadow:0 0 6px var(--ac)}.dot.off{background:var(--dn);box-shadow:0 0 6px var(--dn)}
 .ol-st{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--mt);padding:4px 10px;border-radius:var(--rs);background:var(--bg);border:1px solid var(--bd)}
+
 .btn{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--cd);color:var(--tx);font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;font-family:var(--f)}
-.btn:hover{border-color:var(--bdh);background:var(--cdh)}.btn:disabled{opacity:.35;cursor:not-allowed;transform:none!important;box-shadow:none!important}
-.btn-p{background:var(--ac);color:#000;border-color:var(--ac)}.btn-p:hover{background:var(--ach);border-color:var(--ach);transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,214,143,.25)}
-.btn-d{color:var(--dn);border-color:rgba(255,92,92,.3);background:var(--dnd)}.btn-d:hover{background:rgba(255,92,92,.18)}
+.btn:hover{border-color:var(--bdh);background:var(--cdh)}
+.btn:disabled{opacity:.35;cursor:not-allowed;transform:none!important;box-shadow:none!important}
+.btn-p{background:var(--ac);color:#000;border-color:var(--ac)}
+.btn-p:hover{background:var(--ach);border-color:var(--ach);transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,214,143,.25)}
+.btn-d{color:var(--dn);border-color:rgba(255,92,92,.3);background:var(--dnd)}
+.btn-d:hover{background:rgba(255,92,92,.18)}
 .btn-sm{padding:4px 10px;font-size:11px}.btn-ic{padding:4px 7px}
+
 .body{display:flex;flex:1;overflow:hidden}
-.side{width:300px;min-width:300px;background:var(--sf);border-right:1px solid var(--bd);overflow-y:auto;padding:12px}
+.side{width:310px;min-width:310px;background:var(--sf);border-right:1px solid var(--bd);overflow-y:auto;padding:12px}
 .main{flex:1;overflow-y:auto;padding:20px 24px}
+
 .card{background:var(--cd);border:1px solid var(--bd);border-radius:var(--r);padding:13px;margin-bottom:10px}
 .card-t{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--mt);margin-bottom:10px;display:flex;align-items:center;gap:5px}
-.fld{margin-bottom:9px}.fld label{display:block;font-size:10px;font-weight:600;color:var(--mt);margin-bottom:3px}
-input[type=text],select,textarea{width:100%;background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);padding:6px 9px;color:var(--tx);font-size:12px;font-family:var(--f);outline:none;transition:border .15s}
-input:focus,select:focus,textarea:focus{border-color:var(--ac)}select{cursor:pointer;appearance:auto}
+
+.fld{margin-bottom:9px}
+.fld label{display:block;font-size:10px;font-weight:600;color:var(--mt);margin-bottom:3px}
+input[type=text],input[type=date],select,textarea{width:100%;background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);padding:6px 9px;color:var(--tx);font-size:12px;font-family:var(--f);outline:none;transition:border .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--ac)}
+select{cursor:pointer;appearance:auto}
 textarea{resize:vertical;min-height:52px}
-.fld-row{display:flex;gap:7px}.fld-row .fld{flex:1}.fld-inl{display:flex;gap:5px;align-items:flex-end}.fld-inl .fld{flex:1;margin-bottom:0}
+.fld-row{display:flex;gap:7px}.fld-row .fld{flex:1}
+.fld-inl{display:flex;gap:5px;align-items:flex-end}.fld-inl .fld{flex:1;margin-bottom:0}
+
 .tog{position:relative;display:inline-block;width:32px;height:17px;flex-shrink:0}
-.tog input{display:none}.tog .tr{position:absolute;inset:0;background:var(--bd);border-radius:9px;cursor:pointer;transition:.2s}
-.tog input:checked+.tr{background:var(--ac)}.tog .tr::after{content:'';position:absolute;width:13px;height:13px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.2s}
+.tog input{display:none}
+.tog .tr{position:absolute;inset:0;background:var(--bd);border-radius:9px;cursor:pointer;transition:.2s}
+.tog input:checked+.tr{background:var(--ac)}
+.tog .tr::after{content:'';position:absolute;width:13px;height:13px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.2s}
 .tog input:checked+.tr::after{transform:translateX(15px)}
-.flist{max-height:340px;overflow-y:auto}
+
+.flist{max-height:320px;overflow-y:auto}
 .fi{padding:4px 7px;border-radius:var(--rs);cursor:pointer;display:flex;align-items:center;gap:5px;font-size:11px;color:var(--mt);transition:.1s}
 .fi:hover{background:var(--acd);color:var(--tx)}.fi.sel{background:var(--acd);color:var(--ac);font-weight:600}
+
 .rc{border:1px solid var(--bd);border-radius:var(--r);background:var(--cd);margin-bottom:9px;overflow:hidden;transition:border .2s}
-.rc:hover{border-color:var(--bdh)}.rc.running{border-color:var(--in);box-shadow:0 0 0 1px var(--ind)}
+.rc:hover{border-color:var(--bdh)}
+.rc.running{border-color:var(--in);box-shadow:0 0 0 1px var(--ind)}
 .rc.error{border-color:var(--dn)}.rc.done{border-color:var(--ac)}.rc.stopped{border-color:var(--wn)}
-.rh{display:flex;align-items:center;padding:11px 13px;gap:9px}.rn{flex:1;font-weight:600;font-size:13px}
+.rh{display:flex;align-items:center;padding:11px 13px;gap:9px}
+.rn{flex:1;font-weight:600;font-size:13px}
 .rm{padding:0 13px 9px;display:flex;flex-wrap:wrap;gap:11px;font-size:10px;color:var(--mt)}
 .rmi{display:flex;align-items:center;gap:3px}.rmi strong{color:var(--tx);font-weight:600}
-.pw{padding:0 13px 11px}.pb{height:3px;background:var(--bd);border-radius:2px;overflow:hidden}
+
+.pw{padding:0 13px 11px}
+.pb{height:3px;background:var(--bd);border-radius:2px;overflow:hidden}
 .pf{height:100%;background:var(--ac);border-radius:2px;transition:width .4s}
-.pf.error{background:var(--dn)}.pf.running{background:linear-gradient(90deg,var(--ac),var(--in));background-size:200% 100%;animation:shim 1.5s infinite}
+.pf.error{background:var(--dn)}
+.pf.running{background:linear-gradient(90deg,var(--ac),var(--in));background-size:200% 100%;animation:shim 1.5s infinite}
 .pf.connecting,.pf.searching{background:var(--in)}
 @keyframes shim{0%{background-position:200% 0}100%{background-position:-200% 0}}
 .pm{font-size:10px;color:var(--mt);margin-top:5px;font-family:var(--m)}
+
 .badge{display:inline-flex;align-items:center;gap:3px;padding:1px 7px;border-radius:9px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
 .badge.done{background:var(--acd);color:var(--ac)}.badge.running{background:var(--ind);color:var(--in)}
 .badge.error{background:var(--dnd);color:var(--dn)}.badge.stopped{background:var(--wnD);color:var(--wn)}
 .badge.connecting,.badge.searching{background:var(--ind);color:var(--in)}
+
 .mo{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(3px);animation:fi .15s}
 @keyframes fi{from{opacity:0}to{opacity:1}}
-.md{background:var(--cd);border:1px solid var(--bd);border-radius:12px;padding:22px;width:500px;max-height:85vh;overflow-y:auto;animation:su .2s}
+.md{background:var(--cd);border:1px solid var(--bd);border-radius:12px;padding:22px;width:560px;max-height:88vh;overflow-y:auto;animation:su .2s}
 @keyframes su{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}
 .md-t{font-size:15px;font-weight:700;margin-bottom:16px}
 .md-a{display:flex;justify-content:flex-end;gap:7px;margin-top:18px;padding-top:14px;border-top:1px solid var(--bd)}
+
 .tc{position:fixed;top:12px;right:12px;z-index:200;display:flex;flex-direction:column;gap:7px;pointer-events:none}
-.tt{padding:9px 14px;border-radius:var(--r);font-size:11px;font-weight:500;animation:ti .25s;max-width:320px;pointer-events:auto;border:1px solid}
+.tt{padding:9px 14px;border-radius:var(--r);font-size:11px;font-weight:500;animation:ti .25s;max-width:340px;pointer-events:auto;border:1px solid}
 @keyframes ti{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
-.tt.ok{background:#081f15;border-color:var(--ac);color:var(--ac)}.tt.er{background:#1f0808;border-color:var(--dn);color:var(--dn)}.tt.in{background:#081520;border-color:var(--in);color:var(--in)}
+.tt.ok{background:#081f15;border-color:var(--ac);color:var(--ac)}
+.tt.er{background:#1f0808;border-color:var(--dn);color:var(--dn)}
+.tt.in{background:#081520;border-color:var(--in);color:var(--in)}
+
 .sp{display:inline-block;width:11px;height:11px;border:2px solid var(--bd);border-top-color:var(--ac);border-radius:50%;animation:rot .6s linear infinite}
 @keyframes rot{to{transform:rotate(360deg)}}
-.empty{text-align:center;padding:44px 20px;color:var(--dm)}.empty-i{font-size:38px;margin-bottom:8px;opacity:.35}
+
+.empty{text-align:center;padding:44px 20px;color:var(--dm)}
+.empty-i{font-size:38px;margin-bottom:8px;opacity:.35}
 .empty p{font-size:13px;margin-bottom:3px}.empty .h{font-size:11px}
 .sec-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}
 .sec-t{font-size:14px;font-weight:700}
 .ls{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:14px;background:var(--bg)}
 .ls .sp{width:26px;height:26px;border-width:3px}
+
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
 .hint{font-size:10px;color:var(--dm);margin-top:3px;line-height:1.4}
+.div{height:1px;background:var(--bd);margin:10px 0}
+
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:var(--ind);color:#fff;margin-right:3px}
+.tag.green{background:var(--acd);color:var(--ac)}
+.tag.orange{background:var(--wnD);color:var(--wn)}
 </style>
 </head>
 <body>
@@ -538,12 +690,16 @@ textarea{resize:vertical;min-height:52px}
       <aside class="side">
         <div class="card">
           <div class="card-t">&#128172; Outlook Status</div>
-          <button class="btn btn-sm" style="width:100%" @click="checkOL" :disabled="olBusy">{{ olBusy ? 'Checking...' : 'Check Connection' }}</button>
+          <button class="btn btn-sm" style="width:100%" @click="checkOL" :disabled="olBusy">
+            {{ olBusy ? 'Checking...' : 'Check Connection' }}
+          </button>
           <p class="hint" style="margin-top:6px">Uses your local Outlook desktop app. Ensure Outlook is open and signed in.</p>
         </div>
         <div class="card">
           <div class="card-t">&#128193; Folders</div>
-          <button class="btn btn-sm" style="width:100%;margin-bottom:7px" @click="fetchFolders" :disabled="fBusy">{{ fBusy ? 'Loading...' : 'Load All Folders' }}</button>
+          <button class="btn btn-sm" style="width:100%;margin-bottom:7px" @click="fetchFolders" :disabled="fBusy">
+            {{ fBusy ? 'Loading...' : 'Load All Folders' }}
+          </button>
           <div v-if="folders.length" class="flist">
             <div v-for="f in folders" :key="f.entry_id||f.path"
                  class="fi" :class="{sel: selFolder&&selFolder.entry_id===f.entry_id}"
@@ -554,7 +710,15 @@ textarea{resize:vertical;min-height:52px}
           <div v-else style="font-size:10px;color:var(--dm);text-align:center;padding:10px 0">Click "Load All Folders" to browse</div>
         </div>
         <div class="card" style="background:var(--bg);border-color:var(--bd)">
-          <p class="hint"><strong style="color:var(--mt)">How it works:</strong><br>1. Check Outlook connection<br>2. Load & select a folder<br>3. Create a rule with keywords<br>4. Click "Run All Rules"<br><br>Only <strong style="color:var(--ac)">new emails</strong> are scanned each time. Already-downloaded files are skipped via the tracking database.</p>
+          <p class="hint">
+            <strong style="color:var(--mt)">How it works:</strong><br>
+            1. Check Outlook connection<br>
+            2. Load &amp; select a folder<br>
+            3. Create a rule with filters<br>
+            4. Click "Run All Rules"<br><br>
+            Only <strong style="color:var(--ac)">new emails</strong> are scanned each time.
+            Inline/hidden images are always skipped.
+          </p>
         </div>
       </aside>
       <main class="main">
@@ -569,7 +733,10 @@ textarea{resize:vertical;min-height:52px}
         </div>
         <div v-for="rule in rules" :key="rule.id" class="rc" :class="ruleCls(rule.id)">
           <div class="rh">
-            <label class="tog"><input type="checkbox" :checked="rule.enabled" @change="toggleRule(rule.id)"><span class="tr"></span></label>
+            <label class="tog">
+              <input type="checkbox" :checked="rule.enabled" @change="toggleRule(rule.id)">
+              <span class="tr"></span>
+            </label>
             <span class="rn">{{ rule.name }}</span>
             <span v-if="badge(rule.id)" class="badge" :class="badge(rule.id).c">{{ badge(rule.id).l }}</span>
             <button class="btn btn-sm btn-ic" @click="openModal(rule)" title="Edit">&#9998;</button>
@@ -577,8 +744,14 @@ textarea{resize:vertical;min-height:52px}
           </div>
           <div class="rm">
             <span class="rmi">&#128193; <strong>{{ rule.folder_path }}</strong></span>
+            <span class="rmi" v-if="rule.sender_email">&#128100; <strong>{{ rule.sender_email }}</strong></span>
             <span class="rmi" v-if="rule.subject_keywords">&#128270; {{ rule.subject_keywords }} <strong>({{ rule.match_mode }})</strong></span>
-            <span class="rmi">&#128194; {{ shortPath(rule.destination) }}</span>
+            <span class="rmi" v-if="rule.attachment_types">&#128196; <strong>{{ rule.attachment_types }}</strong></span>
+            <span class="rmi" v-if="rule.received_after">&#128197; after <strong>{{ rule.received_after }}</strong></span>
+            <span class="rmi">
+              &#128194; {{ shortPath(rule.destination) }}
+              <span class="tag" v-if="!rule.use_prefix" style="margin-left:4px">no prefix</span>
+            </span>
             <span class="rmi" v-if="rule.last_check">&#128339; {{ fmtDate(rule.last_check) }}</span>
           </div>
           <div v-if="prog(rule.id)" class="pw">
@@ -588,42 +761,94 @@ textarea{resize:vertical;min-height:52px}
         </div>
         <div v-if="rules.length" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--bd)">
           <div class="card-t" style="margin-bottom:7px">&#9888; Reset Tracking</div>
-          <p class="hint" style="margin-bottom:7px">Clear a rule's tracking history in the database to force a full re-scan.</p>
+          <p class="hint" style="margin-bottom:7px">Clear a rule's tracking history to force a full re-scan.</p>
           <div style="display:flex;flex-wrap:wrap;gap:5px">
             <button v-for="r in rules" :key="'z'+r.id" class="btn btn-sm btn-d" @click="resetTrack(r.id)">{{ r.name }}</button>
           </div>
         </div>
       </main>
     </div>
+
+    <!-- Modal -->
     <div class="mo" v-if="showMo" @click.self="showMo=false">
       <div class="md">
         <div class="md-t">{{ editRule ? 'Edit Rule' : 'New Rule' }}</div>
-        <div class="fld"><label>Rule Name</label><input type="text" v-model="fm.name" placeholder="e.g. Invoice Attachments"></div>
-        <div class="fld">
-          <label>Folder</label>
-          <input type="text" v-model="fm.folder" placeholder="Click a folder in the sidebar">
+        
+        <div class="fld"><label>Rule Name</label>
+          <input type="text" v-model="fm.name" placeholder="e.g. Invoice PDFs from Finance">
+        </div>
+
+        <div class="fld"><label>Outlook Folder</label>
+          <input type="text" v-model="fm.folder_path" placeholder="Click a folder in the sidebar">
           <p class="hint">Select a folder from the sidebar to auto-fill</p>
         </div>
+
+        <div class="div"></div>
+        <div class="card-t" style="margin-bottom:8px">&#128270; Filters</div>
+
+        <div class="fld"><label>Sender Email (partial match)</label>
+          <input type="text" v-model="fm.sender_email" placeholder="e.g. finance@company.com">
+          <p class="hint">Leave empty to match all senders</p>
+        </div>
+
         <div class="fld-row">
-          <div class="fld"><label>Subject Keywords (comma separated)</label><input type="text" v-model="fm.subject_keywords" placeholder="invoice, receipt">
-            <p class="hint">Leave empty to match all emails</p>
+          <div class="fld"><label>Subject Keywords (comma separated)</label>
+            <input type="text" v-model="fm.subject_keywords" placeholder="invoice, receipt">
+            <p class="hint">Leave empty to match all subjects</p>
           </div>
           <div class="fld" style="max-width:110px"><label>Match Mode</label>
-            <select v-model="fm.match_mode"><option value="any">Any word</option><option value="all">All words</option></select>
+            <select v-model="fm.match_mode">
+              <option value="any">Any word</option>
+              <option value="all">All words</option>
+            </select>
           </div>
         </div>
-        <div class="fld">
-          <label>Download Destination (Local Path)</label>
-          <input type="text" v-model="fm.destination" placeholder="C:\\Users\\...\\Downloads\\Invoices">
-          <p class="hint">Full path to where attachments should be saved</p>
+
+        <div class="fld-row">
+          <div class="fld"><label>Attachment Types (comma separated)</label>
+            <input type="text" v-model="fm.attachment_types" placeholder="pdf, xlsx, docx">
+            <p class="hint">Leave empty to download all file types. Inline/hidden images are always skipped.</p>
+          </div>
+          <div class="fld" style="max-width:150px">
+            <label>Received After</label>
+            <input type="date" v-model="fm.received_after">
+            <p class="hint">Blank = no restriction</p>
+          </div>
         </div>
+
+        <div class="div"></div>
+        <div class="card-t" style="margin-bottom:8px">&#128190; Save Options</div>
+
+        <div class="fld"><label>Download Destination (Full Local Path)</label>
+          <input type="text" v-model="fm.destination" placeholder="C:\\Users\\...\\Downloads\\Invoices">
+        </div>
+
+        <div class="fld" style="display:flex;align-items:center;gap:10px;margin-top:2px">
+          <label class="tog">
+            <input type="checkbox" v-model="fm.use_prefix">
+            <span class="tr"></span>
+          </label>
+          <div>
+            <label style="font-size:11px;color:var(--tx);cursor:pointer" @click="fm.use_prefix=!fm.use_prefix">Add Date Prefix</label>
+            <p class="hint" style="margin-top:1px">
+              ON: <code style="color:var(--ac)">20240115_103000_report.pdf</code><br>
+              OFF: <code style="color:var(--wn)">report.pdf</code> (original name kept)
+            </p>
+          </div>
+        </div>
+
         <div class="md-a">
           <button class="btn" @click="showMo=false">Cancel</button>
-          <button class="btn btn-p" @click="saveRule" :disabled="!fm.name||!fm.folder||!fm.destination">{{ editRule ? 'Update' : 'Create' }}</button>
+          <button class="btn btn-p" @click="saveRule" :disabled="!fm.name||!fm.folder_path||!fm.destination">
+            {{ editRule ? 'Update' : 'Create' }}
+          </button>
         </div>
       </div>
     </div>
-    <div class="tc"><div v-for="t in toasts" :key="t.id" class="tt" :class="t.t">{{ t.m }}</div></div>
+
+    <div class="tc">
+      <div v-for="t in toasts" :key="t.id" class="tt" :class="t.t">{{ t.m }}</div>
+    </div>
   </template>
 </div>
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
@@ -634,57 +859,141 @@ createApp({setup(){
         olBusy=ref(false),fBusy=ref(false),olOk=ref(false),olMsg=ref('Not checked'),
         isRunning=ref(false),progs=ref([]),showMo=ref(false),editRule=ref(null),toasts=ref([]),
         stats=reactive({total_files:0,total_rules:0,enabled:0});
-  const fm=reactive({name:'',folder:'',entry_id:'',subject_keywords:'',match_mode:'any',destination:''});
+
+  const fm=reactive({
+    name:'',folder_path:'',entry_id:'',sender_email:'',subject_keywords:'',
+    match_mode:'any',attachment_types:'',use_prefix:true,received_after:'',destination:''
+  });
+
   let poll=null,tid=0;
 
-  const fetch=async(url,o={})=>{const r=await fetch(url,{headers:{'Content-Type':'application/json',...o.headers},...o});return r.json()};
-  const post=async(url,body)=>fetch(url,{method:'POST',body:JSON.stringify(body)});
-  const del=async(url)=>fetch(url,{method:'DELETE'});
+  const get=async u=>{const r=await fetch(u);return r.json()};
+  const post=async(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());
+  const del=async u=>fetch(u,{method:'DELETE'}).then(r=>r.json());
 
   function toast(m,t='in'){const id=++tid;toasts.value.push({id,m,t});setTimeout(()=>{toasts.value=toasts.value.filter(x=>x.id!==id)},4000)}
 
-  async function checkOL(){olBusy.value=true;try{const r=await fetch('/api/status');olOk.value=r.ok;olMsg.value=r.msg;if(r.ok)toast('Outlook connected','ok')}catch(e){olOk.value=false;olMsg.value='Server error'}olBusy.value=false}
-  async function fetchFolders(){fBusy.value=true;try{const r=await fetch('/api/folders');if(r.ok){folders.value=r.folders;toast(r.folders.length+' folders loaded','ok')}else toast(r.msg,'er')}catch(e){toast('Failed','er')}fBusy.value=false}
+  async function checkOL(){
+    olBusy.value=true;
+    try{
+      const r=await get('/api/status');
+      olOk.value=r.ok;olMsg.value=r.msg;
+      if(r.ok)toast('Outlook connected','ok');
+    }catch(e){olOk.value=false;olMsg.value='Server error'}
+    olBusy.value=false;
+  }
 
-  watch(selFolder,f=>{if(f&&showMo.value){fm.folder=f.name;fm.entry_id=f.entry_id}});
+  async function fetchFolders(){
+    fBusy.value=true;
+    try{
+      const r=await get('/api/folders');
+      if(r.ok){folders.value=r.folders;toast(r.folders.length+' folders loaded','ok')}
+      else toast(r.msg,'er');
+    }catch(e){toast('Failed','er')}
+    fBusy.value=false;
+  }
 
-  async function loadRules(){try{rules.value=await fetch('/api/rules')}catch(e){}}
-  async function toggleRule(id){try{await post('/api/rules/'+id+'/toggle');rules.value.find(r=>r.id===id).enabled=!rules.value.find(r=>r.id===id).enabled;await loadStats()}catch(e){}}
-  async function deleteRule(id){rules.value=rules.value.filter(r=>r.id!==id);try{await del('/api/rules/'+id);toast('Deleted','ok');await loadStats()}catch(e){}}
+  watch(selFolder,f=>{if(f&&showMo.value){fm.folder_path=f.name;fm.entry_id=f.entry_id}});
+
+  async function loadRules(){try{rules.value=await get('/api/rules')}catch(e){}}
+  async function loadStats(){try{Object.assign(stats,await get('/api/stats'))}catch(e){}}
+
+  async function toggleRule(id){
+    try{
+      await post('/api/rules/'+id+'/toggle');
+      const r=rules.value.find(x=>x.id===id);
+      if(r)r.enabled=!r.enabled;
+      await loadStats();
+    }catch(e){}
+  }
+
+  async function deleteRule(id){
+    rules.value=rules.value.filter(r=>r.id!==id);
+    try{await del('/api/rules/'+id);toast('Deleted','ok');await loadStats()}catch(e){}
+  }
 
   function openModal(r){
     editRule.value=r||null;
-    if(r){fm.name=r.name;fm.folder=r.folder_path;fm.entry_id=r.entry_id;fm.subject_keywords=r.subject_keywords||'';fm.match_mode=r.match_mode||'any';fm.destination=r.destination}
-    else{fm.name='';fm.folder='';fm.entry_id='';fm.subject_keywords='';fm.match_mode='any';fm.destination='';if(selFolder.value){fm.folder=selFolder.value.name;fm.entry_id=selFolder.value.entry_id}}
-    showMo.value=true
+    if(r){
+      fm.name=r.name;fm.folder_path=r.folder_path;fm.entry_id=r.entry_id;
+      fm.sender_email=r.sender_email||'';fm.subject_keywords=r.subject_keywords||'';
+      fm.match_mode=r.match_mode||'any';fm.attachment_types=r.attachment_types||'';
+      fm.use_prefix=!!r.use_prefix;fm.received_after=r.received_after||'';
+      fm.destination=r.destination;
+    }else{
+      fm.name='';fm.folder_path='';fm.entry_id='';fm.sender_email='';fm.subject_keywords='';
+      fm.match_mode='any';fm.attachment_types='';fm.use_prefix=true;fm.received_after='';fm.destination='';
+      if(selFolder.value){fm.folder_path=selFolder.value.name;fm.entry_id=selFolder.value.entry_id}
+    }
+    showMo.value=true;
   }
+
   async function saveRule(){
-    if(!fm.name||!fm.folder||!fm.destination)return;
-    const d={id:editRule.value?editRule.value.id:'r_'+Date.now()+'_'+Math.random().toString(36).slice(2,7),name:fm.name,folder_path:fm.folder,entry_id:fm.entry_id||fm.folder,subject_keywords:fm.subject_keywords,match_mode:fm.match_mode,destination:fm.destination,enabled:true,last_check:editRule.value?editRule.value.last_check:null};
-    await post('/api/rules',d);showMo.value=false;await loadRules();await loadStats();toast(editRule.value?'Updated':'Created','ok')
+    if(!fm.name||!fm.folder_path||!fm.destination)return;
+    const d={
+      id:editRule.value?editRule.value.id:'r_'+Date.now()+'_'+Math.random().toString(36).slice(2,7),
+      name:fm.name,folder_path:fm.folder_path,entry_id:fm.entry_id||fm.folder_path,
+      sender_email:fm.sender_email,subject_keywords:fm.subject_keywords,match_mode:fm.match_mode,
+      attachment_types:fm.attachment_types,use_prefix:fm.use_prefix,received_after:fm.received_after,
+      destination:fm.destination,enabled:true,last_check:editRule.value?editRule.value.last_check:null
+    };
+    await post('/api/rules',d);
+    showMo.value=false;
+    await loadRules();await loadStats();
+    toast(editRule.value?'Updated':'Created','ok');
   }
 
-  async function runAll(){try{const r=await post('/api/run');if(r.ok){isRunning.value=true;startPoll();toast('Started rule(s)','ok')}else toast(r.msg||'Cannot start','er')}catch(e){toast('Error','er')}}
+  async function runAll(){
+    try{
+      const r=await post('/api/run');
+      if(r.ok){isRunning.value=true;startPoll();toast('Started rule(s)','ok')}
+      else toast(r.msg||'Cannot start','er');
+    }catch(e){toast('Error','er')}
+  }
+
   async function stopAll(){try{await post('/api/stop');toast('Stopping...','in')}catch(e){}}
-  async function resetTrack(id){if(!confirm('Reset tracking for this rule? All attachments will be re-scanned on next run.'))return;try{await post('/api/rules/'+id+'/reset');toast('Tracking reset','ok')}catch(e){}}
+  async function resetTrack(id){
+    if(!confirm('Reset tracking for this rule?'))return;
+    try{await post('/api/rules/'+id+'/reset');toast('Tracking reset','ok')}catch(e){}
+  }
 
-  async function loadStats(){try{Object.assign(stats,await fetch('/api/stats'))}catch(e){}}
-
-  function startPoll(){if(poll)return;poll=setInterval(async()=>{try{const r=await fetch('/api/progress');progs.value=r.items||[];isRunning.value=r.running;if(!r.running&&poll){clearInterval(poll);poll=null;await loadRules();await loadStats();const errs=(r.items||[]).filter(i=>i.status==='error');if(errs.length)toast(errs.length+' rule(s) failed','er');else if(r.items&&r.items.length)toast('All rules completed','ok')}}catch(e){}},350)}
+  function startPoll(){
+    if(poll)return;
+    poll=setInterval(async()=>{
+      try{
+        const r=await get('/api/progress');
+        progs.value=r.items||[];isRunning.value=r.running;
+        if(!r.running&&poll){
+          clearInterval(poll);poll=null;
+          await loadRules();await loadStats();
+          const errs=(r.items||[]).filter(i=>i.status==='error');
+          if(errs.length)toast(errs.length+' rule(s) failed','er');
+          else if(r.items&&r.items.length)toast('All rules completed','ok');
+        }
+      }catch(e){}
+    },350);
+  }
 
   const prog=id=>progs.value.find(p=>p.rule_id===id)||null;
   const badge=id=>{const p=prog(id);if(!p)return null;const m={connecting:{l:'Connecting',c:'connecting'},searching:{l:'Searching',c:'searching'},processing:{l:'Running',c:'running'},done:{l:'Done',c:'done'},error:{l:'Error',c:'error'},stopped:{l:'Stopped',c:'stopped'}};return m[p.status]||null};
   const ruleCls=id=>{const p=prog(id);return p?p.status:''};
-  function shortPath(p){if(!p)return'';const parts=p.replace(/\\\\/g,'/').split('/');if(parts.length<=3)return p;return'.../'+parts.slice(-2).join('/')}
+  function shortPath(p){if(!p)return'';const s=p.replace(/\\\\/g,'/').split('/');if(s.length<=3)return p;return'.../'+s.slice(-2).join('/')}
   function fmtDate(iso){try{const d=new Date(iso);return d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})}catch(e){return iso}}
 
-  async function init(){await loadRules();await loadStats();try{const r=await fetch('/api/status');olOk.value=r.ok;olMsg.value=r.msg}catch(e){olMsg.value='Offline'}ready.value=true}
+  async function init(){
+    await loadRules();await loadStats();
+    try{const r=await get('/api/status');olOk.value=r.ok;olMsg.value=r.msg}catch(e){olMsg.value='Offline'}
+    ready.value=true;
+  }
 
   onMounted(init);
   onUnmounted(()=>{if(poll)clearInterval(poll)});
 
-  return{ready,rules,folders,selFolder,olBusy,fBusy,olOk,olMsg,isRunning,progs,showMo,editRule,fm,toasts,stats,
-    checkOL,fetchFolders,loadRules,toggleRule,deleteRule,openModal,saveRule,runAll,stopAll,resetTrack,prog,badge,ruleCls,shortPath,fmtDate}
+  return{
+    ready,rules,folders,selFolder,olBusy,fBusy,olOk,olMsg,isRunning,progs,showMo,editRule,fm,toasts,stats,
+    checkOL,fetchFolders,loadRules,loadStats,toggleRule,deleteRule,openModal,saveRule,runAll,stopAll,resetTrack,
+    prog,badge,ruleCls,shortPath,fmtDate
+  };
 }}).mount('#app');
 </script>
 </body>
